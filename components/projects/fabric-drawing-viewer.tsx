@@ -1,0 +1,1054 @@
+"use client";
+
+import * as React from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
+import * as fabric from "fabric";
+import * as pdfjsLib from "pdfjs-dist";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import { type ToolMode, type Layer, type StampType } from "@/components/kokonutui/pdf-toolbar";
+import { cn } from "@/lib/utils";
+import {
+  Maximize2,
+  Minimize2,
+  Plus,
+  Minus,
+} from "lucide-react";
+
+// Configure PDF.js worker
+if (typeof window !== "undefined") {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+}
+
+type FabricDrawingViewerProps = {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  pdfUrl: string;
+  title: string;
+  description?: string;
+  drawingId?: string;
+  dwgNo?: string;
+  status?: string;
+  releaseStatus?: string;
+  onSave?: (data: DrawingData) => Promise<void>;
+  initialData?: DrawingData;
+};
+
+export type DrawingData = {
+  annotations: string; // JSON string of Fabric.js objects
+  layers: Layer[];
+  currentRevision: number;
+  revisions: Record<number, string>; // revision number -> annotations JSON
+};
+
+export function FabricDrawingViewer({
+  open,
+  onOpenChange,
+  pdfUrl,
+  title,
+  description,
+  drawingId,
+  dwgNo,
+  status,
+  releaseStatus,
+  onSave,
+  initialData,
+}: FabricDrawingViewerProps) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const pdfCanvasRef = useRef<HTMLCanvasElement>(null);
+  const fabricCanvasRef = useRef<fabric.Canvas | null>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  
+  // Tool state
+  const [selectedTool, setSelectedTool] = useState<ToolMode>("select");
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [drawingStart, setDrawingStart] = useState<{ x: number; y: number } | null>(null);
+  const currentPathRef = useRef<fabric.Path | null>(null);
+  const currentShapeRef = useRef<fabric.Object | null>(null);
+  const isPanningRef = useRef(false);
+  const lastPanPointRef = useRef<{ x: number; y: number } | null>(null);
+  
+  // PDF state
+  const [currentPage, setCurrentPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(0);
+  const [pdfDoc, setPdfDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
+  const [zoomLevel, setZoomLevel] = useState(100);
+  
+  // Layer state
+  const [layers, setLayers] = useState<Layer[]>(
+    initialData?.layers || [{ id: "default", name: "Default", visible: true, locked: false }]
+  );
+  const [selectedLayerId, setSelectedLayerId] = useState<string>(
+    layers[0]?.id || "default"
+  );
+  
+  // Revision state
+  const [currentRevision, setCurrentRevision] = useState<number>(
+    initialData?.currentRevision || 1
+  );
+  const [availableRevisions, setAvailableRevisions] = useState<number[]>([1]);
+  const revisionDataRef = useRef<Record<number, string>>(
+    initialData?.revisions || { 1: "[]" }
+  );
+  
+  // Tool settings
+  const [penColor, setPenColor] = useState("#000000");
+  const [penStrokeWidth, setPenStrokeWidth] = useState(2);
+  const [shapeColor, setShapeColor] = useState("#F44336");
+  const [shapeStrokeWidth, setShapeStrokeWidth] = useState(2);
+  const [selectedStamp, setSelectedStamp] = useState<StampType>("approved");
+  
+  // Save state
+  const [saveStatus, setSaveStatus] = useState<"saved" | "saving" | "unsaved">("saved");
+  const [isSaving, setIsSaving] = useState(false);
+  
+  // History for undo/redo
+  const historyRef = useRef<string[]>([]);
+  const historyIndexRef = useRef(-1);
+  
+  // Load drawing data from backend
+  useEffect(() => {
+    if (!open || !drawingId) {
+      // Use initialData if provided and no drawingId
+      if (initialData && !drawingId) {
+        if (initialData.layers && initialData.layers.length > 0) {
+          setLayers(initialData.layers);
+          setSelectedLayerId(initialData.layers[0]?.id || "default");
+        }
+        if (initialData.currentRevision) {
+          setCurrentRevision(initialData.currentRevision);
+        }
+        if (initialData.revisions) {
+          revisionDataRef.current = initialData.revisions;
+        }
+      }
+      return;
+    }
+    
+    const loadDrawingData = async () => {
+      try {
+        // Load current revision data
+        const response = await fetch(
+          `/api/drawings/${drawingId}/fabric-drawing?revision=${currentRevision}`
+        );
+        
+        if (response.ok) {
+          const data = await response.json();
+          
+          if (data.annotations && data.layers) {
+            // Update layers
+            if (data.layers && data.layers.length > 0) {
+              setLayers(data.layers);
+              setSelectedLayerId(data.layers[0]?.id || "default");
+            }
+            
+            // Update revisions
+            if (data.revisions) {
+              revisionDataRef.current = data.revisions;
+            }
+            
+            if (data.currentRevision) {
+              setCurrentRevision(data.currentRevision);
+            }
+            
+            // Update available revisions from the revisions object
+            const revNumbers = Object.keys(data.revisions || {})
+              .map(Number)
+              .sort((a, b) => a - b);
+            if (revNumbers.length > 0) {
+              setAvailableRevisions(revNumbers);
+            }
+            
+            // Load annotations into canvas when it's ready
+            if (fabricCanvasRef.current && data.annotations) {
+              try {
+                const parsed = typeof data.annotations === 'string' 
+                  ? JSON.parse(data.annotations) 
+                  : data.annotations;
+                fabricCanvasRef.current.loadFromJSON({ objects: parsed }, () => {
+                  // Tag all objects with layer IDs
+                  fabricCanvasRef.current?.getObjects().forEach((obj) => {
+                    if (!(obj as any).layerId) {
+                      (obj as any).layerId = selectedLayerId;
+                    }
+                  });
+                  fabricCanvasRef.current?.renderAll();
+                  saveToHistory(); // Save loaded state to history
+                });
+              } catch {
+                // Silently handle annotation parsing errors
+              }
+            }
+          }
+        }
+      } catch {
+        // Silently handle drawing data loading errors
+      }
+    };
+    
+    loadDrawingData();
+  }, [open, drawingId]);
+  
+  // Load specific revision when currentRevision changes
+  useEffect(() => {
+    if (!open || !drawingId || !fabricCanvasRef.current) return;
+    
+    const loadRevision = async () => {
+      try {
+        const response = await fetch(
+          `/api/drawings/${drawingId}/fabric-drawing?revision=${currentRevision}`
+        );
+        
+        if (response.ok) {
+          const data = await response.json();
+          
+          if (data.annotations) {
+            try {
+              const parsed = typeof data.annotations === 'string' 
+                ? JSON.parse(data.annotations) 
+                : data.annotations;
+              fabricCanvasRef.current?.loadFromJSON({ objects: parsed }, () => {
+                fabricCanvasRef.current?.getObjects().forEach((obj) => {
+                  if (!(obj as any).layerId) {
+                    (obj as any).layerId = selectedLayerId;
+                  }
+                });
+                fabricCanvasRef.current?.renderAll();
+                saveToHistory();
+              });
+            } catch {
+              // Silently handle revision annotation parsing errors
+            }
+          }
+        }
+      } catch {
+        // Silently handle revision loading errors
+      }
+    };
+    
+    loadRevision();
+  }, [currentRevision, drawingId, open]);
+  
+  // Initialize Fabric.js canvas
+  useEffect(() => {
+    if (!canvasRef.current || !open) return;
+    
+    const updateCanvasSize = () => {
+      if (!containerRef.current || !fabricCanvasRef.current) return;
+      const container = containerRef.current;
+      fabricCanvasRef.current.setDimensions({
+        width: container.clientWidth,
+        height: container.clientHeight,
+      });
+    };
+    
+    const canvas = new fabric.Canvas(canvasRef.current, {
+      width: containerRef.current?.clientWidth || 800,
+      height: containerRef.current?.clientHeight || 600,
+      backgroundColor: "transparent",
+    });
+    
+    fabricCanvasRef.current = canvas;
+    
+    // Handle window resize
+    window.addEventListener("resize", updateCanvasSize);
+    
+    // Load initial data
+    if (initialData?.annotations) {
+      try {
+        const data = JSON.parse(initialData.annotations);
+        canvas.loadFromJSON(data, () => {
+          // Tag all objects with layer IDs
+          canvas.getObjects().forEach((obj) => {
+            if (!(obj as any).layerId) {
+              (obj as any).layerId = selectedLayerId;
+            }
+          });
+          canvas.renderAll();
+        });
+      } catch {
+        // Silently handle initial data loading errors
+      }
+    }
+    
+    // Save initial state for history
+    saveToHistory();
+    
+    // Canvas event handlers
+    canvas.on("path:created", (e) => {
+      if (e.path) {
+        (e.path as any).layerId = selectedLayerId;
+      }
+      saveToHistory();
+      setSaveStatus("unsaved");
+    });
+    
+    canvas.on("object:added", (e) => {
+      if (e.target && !(e.target as any).layerId) {
+        (e.target as any).layerId = selectedLayerId;
+      }
+      saveToHistory();
+      setSaveStatus("unsaved");
+    });
+    
+    canvas.on("object:modified", () => {
+      saveToHistory();
+      setSaveStatus("unsaved");
+    });
+    
+    canvas.on("object:removed", () => {
+      saveToHistory();
+      setSaveStatus("unsaved");
+    });
+    
+    // Multi-select support
+    canvas.on("selection:created", (e) => {
+      if (e.selected) {
+        e.selected.forEach((obj) => {
+          if (!(obj as any).layerId) {
+            (obj as any).layerId = selectedLayerId;
+          }
+        });
+      }
+    });
+    
+    // Mouse wheel zoom
+    canvas.on("mouse:wheel", (opt) => {
+      const delta = opt.e.deltaY;
+      let zoom = canvas.getZoom();
+      zoom *= 0.999 ** delta;
+      zoom = Math.max(0.1, Math.min(5, zoom));
+      const point = new fabric.Point(opt.e.offsetX, opt.e.offsetY);
+      canvas.zoomToPoint(point, zoom);
+      setZoomLevel(Math.round(zoom * 100));
+      opt.e.preventDefault();
+      opt.e.stopPropagation();
+    });
+    
+    // Handle tool-specific interactions
+    setupToolHandlers(canvas);
+    
+    return () => {
+      window.removeEventListener("resize", updateCanvasSize);
+      canvas.dispose();
+      fabricCanvasRef.current = null;
+    };
+  }, [open]);
+  
+  // Setup tool-specific event handlers
+  const setupToolHandlers = (canvas: fabric.Canvas) => {
+    canvas.on("mouse:down", (e) => {
+      const nativeEvent = e.e as MouseEvent;
+      if (!nativeEvent) return;
+      
+      const activeLayer = layers.find((l) => l.id === selectedLayerId);
+      if (activeLayer?.locked && selectedTool !== "select" && selectedTool !== "move") return;
+      
+      const rect = (canvas.getElement() as HTMLCanvasElement).getBoundingClientRect();
+      const pointer = {
+        x: nativeEvent.clientX - rect.left,
+        y: nativeEvent.clientY - rect.top
+      };
+      
+      if (selectedTool === "move") {
+        isPanningRef.current = true;
+        lastPanPointRef.current = pointer;
+        canvas.defaultCursor = "grabbing";
+        return;
+      }
+      
+      switch (selectedTool) {
+        case "pen":
+          startDrawing(pointer.x, pointer.y);
+          break;
+        case "rectangle":
+          startRectangle(pointer.x, pointer.y);
+          break;
+        case "circle":
+          startCircle(pointer.x, pointer.y);
+          break;
+        case "arrow":
+          startArrow(pointer.x, pointer.y);
+          break;
+        case "text":
+          addText(pointer.x, pointer.y);
+          break;
+        case "eraser":
+          eraseAt(pointer.x, pointer.y);
+          break;
+      }
+    });
+    
+    canvas.on("mouse:move", (e) => {
+      const nativeEvent = e.e as MouseEvent;
+      if (!nativeEvent) return;
+      
+      const rect = (canvas.getElement() as HTMLCanvasElement).getBoundingClientRect();
+      const pointer = {
+        x: nativeEvent.clientX - rect.left,
+        y: nativeEvent.clientY - rect.top
+      };
+      
+      // Handle panning
+      if (selectedTool === "move" && isPanningRef.current && lastPanPointRef.current) {
+        const deltaX = pointer.x - lastPanPointRef.current.x;
+        const deltaY = pointer.y - lastPanPointRef.current.y;
+        canvas.relativePan(new fabric.Point(deltaX, deltaY));
+        lastPanPointRef.current = pointer;
+        return;
+      }
+      
+      // Handle pen drawing
+      if (selectedTool === "pen" && isDrawing && currentPathRef.current) {
+        continueDrawing(pointer.x, pointer.y);
+        return;
+      }
+      
+      // Handle rectangle/circle drawing
+      if (selectedTool === "rectangle" && isDrawing && currentShapeRef.current && drawingStart) {
+        updateRectangle(pointer.x, pointer.y);
+        return;
+      }
+      
+      if (selectedTool === "circle" && isDrawing && currentShapeRef.current && drawingStart) {
+        updateCircle(pointer.x, pointer.y);
+        return;
+      }
+      
+      if (selectedTool === "arrow" && isDrawing && currentShapeRef.current && drawingStart) {
+        updateArrow(pointer.x, pointer.y);
+        return;
+      }
+    });
+    
+    canvas.on("mouse:up", () => {
+      if (selectedTool === "move") {
+        isPanningRef.current = false;
+        lastPanPointRef.current = null;
+        canvas.defaultCursor = "move";
+        return;
+      }
+      
+      if (selectedTool === "pen" && isDrawing) {
+        finishDrawing();
+      }
+      
+      if ((selectedTool === "rectangle" || selectedTool === "circle" || selectedTool === "arrow") && isDrawing) {
+        finishShape();
+      }
+    });
+  };
+  
+  // Drawing functions
+  const startDrawing = (x: number, y: number) => {
+    setIsDrawing(true);
+    setDrawingStart({ x, y });
+    const path = new fabric.Path(`M ${x} ${y}`, {
+      stroke: penColor,
+      strokeWidth: penStrokeWidth,
+      fill: "",
+      strokeLineCap: "round",
+      strokeLineJoin: "round",
+      selectable: false,
+      evented: false,
+    });
+    (path as any).layerId = selectedLayerId;
+    currentPathRef.current = path;
+    fabricCanvasRef.current?.add(path);
+  };
+  
+  const continueDrawing = (x: number, y: number) => {
+    if (!currentPathRef.current || !drawingStart) return;
+    const pathData = currentPathRef.current.path;
+    pathData.push(["L", x, y]);
+    currentPathRef.current.set({ path: pathData });
+    fabricCanvasRef.current?.renderAll();
+  };
+  
+  const finishDrawing = () => {
+    setIsDrawing(false);
+    setDrawingStart(null);
+    currentPathRef.current = null;
+  };
+  
+  const startRectangle = (x: number, y: number) => {
+    setIsDrawing(true);
+    setDrawingStart({ x, y });
+    const rect = new fabric.Rect({
+      left: x,
+      top: y,
+      width: 0,
+      height: 0,
+      stroke: shapeColor,
+      strokeWidth: shapeStrokeWidth,
+      fill: "",
+      selectable: false,
+      evented: false,
+    });
+    (rect as any).layerId = selectedLayerId;
+    currentShapeRef.current = rect;
+    fabricCanvasRef.current?.add(rect);
+  };
+  
+  const updateRectangle = (x: number, y: number) => {
+    if (!currentShapeRef.current || !drawingStart) return;
+    const rect = currentShapeRef.current as fabric.Rect;
+    const width = Math.abs(x - drawingStart.x);
+    const height = Math.abs(y - drawingStart.y);
+    const left = Math.min(x, drawingStart.x);
+    const top = Math.min(y, drawingStart.y);
+    
+    rect.set({
+      left,
+      top,
+      width,
+      height,
+    });
+    fabricCanvasRef.current?.renderAll();
+  };
+  
+  const startCircle = (x: number, y: number) => {
+    setIsDrawing(true);
+    setDrawingStart({ x, y });
+    const circle = new fabric.Circle({
+      left: x,
+      top: y,
+      radius: 0,
+      stroke: shapeColor,
+      strokeWidth: shapeStrokeWidth,
+      fill: "",
+      selectable: false,
+      evented: false,
+    });
+    (circle as any).layerId = selectedLayerId;
+    currentShapeRef.current = circle;
+    fabricCanvasRef.current?.add(circle);
+  };
+  
+  const updateCircle = (x: number, y: number) => {
+    if (!currentShapeRef.current || !drawingStart) return;
+    const circle = currentShapeRef.current as fabric.Circle;
+    const radius = Math.sqrt(
+      Math.pow(x - drawingStart.x, 2) + Math.pow(y - drawingStart.y, 2)
+    ) / 2;
+    const left = drawingStart.x - radius;
+    const top = drawingStart.y - radius;
+    
+    circle.set({
+      left,
+      top,
+      radius,
+    });
+    fabricCanvasRef.current?.renderAll();
+  };
+  
+  const startArrow = (x: number, y: number) => {
+    setIsDrawing(true);
+    setDrawingStart({ x, y });
+    const arrowPath = `M ${x} ${y} L ${x} ${y}`;
+    const arrow = new fabric.Path(arrowPath, {
+      stroke: shapeColor,
+      strokeWidth: shapeStrokeWidth,
+      fill: "",
+      selectable: false,
+      evented: false,
+    });
+    (arrow as any).layerId = selectedLayerId;
+    currentShapeRef.current = arrow;
+    fabricCanvasRef.current?.add(arrow);
+  };
+  
+  const updateArrow = (x: number, y: number) => {
+    if (!currentShapeRef.current || !drawingStart) return;
+    const arrow = currentShapeRef.current as fabric.Path;
+    
+    // Create arrow path with arrowhead
+    const dx = x - drawingStart.x;
+    const dy = y - drawingStart.y;
+    const angle = Math.atan2(dy, dx);
+    const arrowLength = Math.sqrt(dx * dx + dy * dy);
+    const arrowHeadLength = 15;
+    const arrowHeadAngle = Math.PI / 6;
+    
+    const x1 = drawingStart.x + arrowLength * Math.cos(angle);
+    const y1 = drawingStart.y + arrowLength * Math.sin(angle);
+    
+    const x2 = x1 - arrowHeadLength * Math.cos(angle - arrowHeadAngle);
+    const y2 = y1 - arrowHeadLength * Math.sin(angle - arrowHeadAngle);
+    
+    const x3 = x1 - arrowHeadLength * Math.cos(angle + arrowHeadAngle);
+    const y3 = y1 - arrowHeadLength * Math.sin(angle + arrowHeadAngle);
+    
+    const pathData = [
+      ["M", drawingStart.x, drawingStart.y],
+      ["L", x1, y1],
+      ["M", x1, y1],
+      ["L", x2, y2],
+      ["M", x1, y1],
+      ["L", x3, y3],
+    ];
+    
+    arrow.set({ path: pathData });
+    fabricCanvasRef.current?.renderAll();
+  };
+  
+  const finishShape = () => {
+    if (currentShapeRef.current) {
+      currentShapeRef.current.set({
+        selectable: true,
+        evented: true,
+      });
+      currentShapeRef.current = null;
+    }
+    setIsDrawing(false);
+    setDrawingStart(null);
+  };
+  
+  const addText = (x: number, y: number) => {
+    const text = new fabric.IText("Double click to edit", {
+      left: x,
+      top: y,
+      fontSize: 16,
+      fill: penColor,
+      selectable: true,
+    });
+    (text as any).layerId = selectedLayerId;
+    fabricCanvasRef.current?.add(text);
+    fabricCanvasRef.current?.setActiveObject(text);
+    text.enterEditing();
+  };
+  
+  const eraseAt = (x: number, y: number) => {
+    const canvas = fabricCanvasRef.current;
+    if (!canvas) return;
+    
+    const point = new fabric.Point(x, y);
+    const objects = canvas.getObjects();
+    
+    // Find objects at this point (check from top to bottom)
+    for (let i = objects.length - 1; i >= 0; i--) {
+      const obj = objects[i];
+      const objLayerId = (obj as any).layerId || "default";
+      const layer = layers.find((l) => l.id === objLayerId);
+      
+      // Skip if layer is locked or hidden
+      if (layer?.locked || !layer?.visible) continue;
+      
+      // Check if point is inside object
+      if (obj.containsPoint(new fabric.Point(x, y))) {
+        canvas.remove(obj);
+        canvas.renderAll();
+        break;
+      }
+    }
+  };
+  
+  // Load PDF
+  useEffect(() => {
+    if (!open || !pdfUrl) return;
+    
+    const loadPdf = async () => {
+      try {
+        const loadingTask = pdfjsLib.getDocument(pdfUrl);
+        const pdf = await loadingTask.promise;
+        setPdfDoc(pdf);
+        setTotalPages(pdf.numPages);
+        renderPdfPage(pdf, 1);
+      } catch {
+        // Silently handle PDF loading errors
+      }
+    };
+    
+    loadPdf();
+  }, [open, pdfUrl]);
+  
+  const renderPdfPage = async (pdf: pdfjsLib.PDFDocumentProxy, pageNum: number) => {
+    try {
+      const page = await pdf.getPage(pageNum);
+      const viewport = page.getViewport({ scale: zoomLevel / 100 });
+      
+      if (!pdfCanvasRef.current) return;
+      
+      const canvas = pdfCanvasRef.current;
+      const context = canvas.getContext("2d");
+      if (!context) return;
+      
+      canvas.height = viewport.height;
+      canvas.width = viewport.width;
+      
+      const renderContext = {
+        canvasContext: context,
+        viewport: viewport,
+        canvas: canvas,
+      };
+      
+      await page.render(renderContext).promise;
+      
+      // Update Fabric canvas size to match PDF
+      if (fabricCanvasRef.current) {
+        fabricCanvasRef.current.setDimensions({
+          width: viewport.width,
+          height: viewport.height,
+        });
+      }
+    } catch {
+      // Silently handle PDF rendering errors
+    }
+  };
+  
+  // Update PDF when page or zoom changes
+  useEffect(() => {
+    if (pdfDoc) {
+      renderPdfPage(pdfDoc, currentPage);
+    }
+  }, [currentPage, zoomLevel, pdfDoc]);
+  
+  // History management
+  const saveToHistory = () => {
+    if (!fabricCanvasRef.current) return;
+    const json = JSON.stringify(fabricCanvasRef.current.toJSON());
+    historyRef.current = historyRef.current.slice(0, historyIndexRef.current + 1);
+    historyRef.current.push(json);
+    historyIndexRef.current = historyRef.current.length - 1;
+    
+    // Limit history size
+    if (historyRef.current.length > 50) {
+      historyRef.current.shift();
+      historyIndexRef.current--;
+    }
+  };
+  
+  const handleUndo = () => {
+    if (historyIndexRef.current <= 0 || !fabricCanvasRef.current) return;
+    historyIndexRef.current--;
+    const json = historyRef.current[historyIndexRef.current];
+    fabricCanvasRef.current.loadFromJSON(JSON.parse(json), () => {
+      fabricCanvasRef.current?.renderAll();
+    });
+  };
+  
+  const handleRedo = () => {
+    if (
+      historyIndexRef.current >= historyRef.current.length - 1 ||
+      !fabricCanvasRef.current
+    )
+      return;
+    historyIndexRef.current++;
+    const json = historyRef.current[historyIndexRef.current];
+    fabricCanvasRef.current.loadFromJSON(JSON.parse(json), () => {
+      fabricCanvasRef.current?.renderAll();
+    });
+  };
+  
+  // Zoom controls
+  const handleZoomIn = () => {
+    setZoomLevel((prev) => Math.min(prev + 10, 500));
+  };
+  
+  const handleZoomOut = () => {
+    setZoomLevel((prev) => Math.max(prev - 10, 25));
+  };
+  
+  const handleResetZoom = () => {
+    setZoomLevel(100);
+  };
+  
+  // Layer management
+  const handleLayerSelect = (layerId: string) => {
+    setSelectedLayerId(layerId);
+  };
+  
+  const handleLayerToggleVisibility = (layerId: string) => {
+    setLayers((prev) =>
+      prev.map((layer) =>
+        layer.id === layerId ? { ...layer, visible: !layer.visible } : layer
+      )
+    );
+    // Hide/show objects on this layer
+    updateLayerVisibility(layerId);
+  };
+  
+  const handleLayerToggleLock = (layerId: string) => {
+    setLayers((prev) =>
+      prev.map((layer) =>
+        layer.id === layerId ? { ...layer, locked: !layer.locked } : layer
+      )
+    );
+  };
+  
+  const handleLayerCreate = (name: string, revisionNumber?: number) => {
+    const newLayer: Layer = {
+      id: `layer-${Date.now()}`,
+      name,
+      visible: true,
+      locked: false,
+      revisionNumber,
+    };
+    setLayers((prev) => [...prev, newLayer]);
+    setSelectedLayerId(newLayer.id);
+  };
+  
+  const updateLayerVisibility = (layerId: string) => {
+    // Implementation to show/hide objects based on layer
+    // This would require storing layer info with each Fabric object
+  };
+  
+  // Revision management
+  const handleRevisionSelect = (revisionNumber: number) => {
+    if (!fabricCanvasRef.current) return;
+    
+    // Save current revision
+    const currentJson = JSON.stringify(fabricCanvasRef.current.toJSON());
+    revisionDataRef.current[currentRevision] = currentJson;
+    
+    // Load selected revision
+    setCurrentRevision(revisionNumber);
+    const revisionJson = revisionDataRef.current[revisionNumber] || "[]";
+    fabricCanvasRef.current.loadFromJSON(JSON.parse(revisionJson), () => {
+      fabricCanvasRef.current?.renderAll();
+    });
+  };
+  
+  // Save functionality
+  const handleSave = async () => {
+    if (!fabricCanvasRef.current) return;
+    
+    setIsSaving(true);
+    setSaveStatus("saving");
+    
+    try {
+      const json = JSON.stringify(fabricCanvasRef.current.toJSON());
+      const currentJson = JSON.stringify(fabricCanvasRef.current.toJSON());
+      revisionDataRef.current[currentRevision] = currentJson;
+      
+      const drawingData: DrawingData = {
+        annotations: json,
+        layers,
+        currentRevision,
+        revisions: revisionDataRef.current,
+      };
+      
+      // Export canvas as image
+      const dataURL = fabricCanvasRef.current.toDataURL({
+        format: "png",
+        quality: 1,
+        multiplier: 2, // Higher resolution
+      });
+      
+      // Convert data URL to blob
+      const response = await fetch(dataURL);
+      const blob = await response.blob();
+      
+      // Create FormData for API
+      const formData = new FormData();
+      formData.append("drawingData", JSON.stringify(drawingData));
+      formData.append("canvasImage", blob, "canvas.png");
+      formData.append("revisionNumber", currentRevision.toString());
+      formData.append("revisionStatus", releaseStatus || "REVISION");
+      
+      // Save to backend
+      if (drawingId) {
+        const saveResponse = await fetch(
+          `/api/drawings/${drawingId}/fabric-drawing`,
+          {
+            method: "POST",
+            body: formData,
+          }
+        );
+        
+        if (!saveResponse.ok) {
+          const errorData = await saveResponse.json();
+          throw new Error(errorData.message || "Failed to save");
+        }
+        
+        const result = await saveResponse.json();
+        
+        // Call onSave callback if provided
+        if (onSave) {
+          await onSave(drawingData);
+        }
+        
+        setSaveStatus("saved");
+      } else {
+        // If no drawingId, just call callback
+        if (onSave) {
+          await onSave(drawingData);
+        }
+        setSaveStatus("saved");
+      }
+    } catch (error) {
+      setSaveStatus("unsaved");
+      alert(`Failed to save: ${error instanceof Error ? error.message : "Unknown error"}`);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+  
+  // Fullscreen toggle
+  const toggleFullscreen = () => {
+    setIsFullscreen(!isFullscreen);
+  };
+  
+  // Page navigation
+  const handlePrevPage = () => {
+    if (currentPage > 1) {
+      setCurrentPage(currentPage - 1);
+    }
+  };
+  
+  const handleNextPage = () => {
+    if (currentPage < totalPages) {
+      setCurrentPage(currentPage + 1);
+    }
+  };
+  
+  // Update canvas selection mode based on tool
+  useEffect(() => {
+    if (!fabricCanvasRef.current) return;
+    const canvas = fabricCanvasRef.current;
+    
+    if (selectedTool === "select") {
+      canvas.selection = true;
+      canvas.defaultCursor = "default";
+      canvas.hoverCursor = "move";
+    } else if (selectedTool === "move") {
+      canvas.selection = false;
+      canvas.defaultCursor = "move";
+      canvas.hoverCursor = "grab";
+    } else if (selectedTool === "eraser") {
+      canvas.selection = false;
+      canvas.defaultCursor = "crosshair";
+      canvas.hoverCursor = "crosshair";
+    } else {
+      canvas.selection = false;
+      canvas.defaultCursor = "crosshair";
+      canvas.hoverCursor = "crosshair";
+    }
+    
+    // Enable multi-select with Shift/Ctrl
+    canvas.on("selection:created", (e) => {
+      if (e.e && (e.e.shiftKey || e.e.ctrlKey || e.e.metaKey)) {
+        const activeObject = canvas.getActiveObject();
+        if (activeObject && activeObject.type === "activeSelection") {
+          // Multi-select is already handled by Fabric.js
+        }
+      }
+    });
+  }, [selectedTool]);
+  
+  // Filter objects by layer visibility
+  useEffect(() => {
+    if (!fabricCanvasRef.current) return;
+    
+    const canvas = fabricCanvasRef.current;
+    const objects = canvas.getObjects();
+    
+    objects.forEach((obj) => {
+      const objLayerId = (obj as any).layerId || "default";
+      const layer = layers.find((l) => l.id === objLayerId);
+      obj.visible = layer?.visible !== false;
+    });
+    
+    canvas.renderAll();
+  }, [layers]);
+  
+  const canUndo = historyIndexRef.current > 0;
+  const canRedo = historyIndexRef.current < historyRef.current.length - 1;
+  
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        showCloseButton={false}
+        className={cn(
+          "max-w-[95vw] w-full h-[90vh] p-0 flex flex-col",
+          isFullscreen && "max-w-[100vw] h-[100vh]"
+        )}
+      >
+        <DialogHeader className="px-6 pt-6 pb-4 shrink-0 border-b">
+          <div className="flex items-start justify-between">
+            <div>
+              <DialogTitle className="text-xl font-semibold">{title}</DialogTitle>
+              {description && (
+                <DialogDescription className="mt-1">{description}</DialogDescription>
+              )}
+              {(status || releaseStatus) && (
+                <div className="mt-2 text-sm text-muted-foreground">
+                  {status && <span>Status: {status}</span>}
+                  {status && releaseStatus && <span> | </span>}
+                  {releaseStatus && <span>Release Status: {releaseStatus}</span>}
+                </div>
+              )}
+            </div>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={toggleFullscreen}
+              className="ml-4"
+            >
+              {isFullscreen ? (
+                <Minimize2 className="h-4 w-4" />
+              ) : (
+                <Maximize2 className="h-4 w-4" />
+              )}
+            </Button>
+          </div>
+        </DialogHeader>
+        
+        {/* Canvas Container */}
+        <div
+          ref={containerRef}
+          className="flex-1 relative overflow-auto bg-gray-100"
+        >
+          <div className="relative inline-block">
+            {/* PDF Canvas (background) */}
+            <canvas
+              ref={pdfCanvasRef}
+              className="absolute top-0 left-0"
+              style={{ display: "block" }}
+            />
+            
+            {/* Fabric Canvas (overlay for drawings) */}
+            <canvas
+              ref={canvasRef}
+              className="relative"
+              style={{ display: "block" }}
+            />
+          </div>
+        </div>
+        
+        {/* Page Navigation */}
+        <div className="px-6 py-3 shrink-0 border-t flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handlePrevPage}
+              disabled={currentPage === 1}
+            >
+              <Minus className="h-4 w-4" />
+            </Button>
+            <span className="text-sm text-muted-foreground">
+              Page {currentPage} / {totalPages}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleNextPage}
+              disabled={currentPage === totalPages}
+            >
+              <Plus className="h-4 w-4" />
+            </Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
