@@ -1,0 +1,98 @@
+{
+  "holidays": [
+    {
+      "date": "01-01",
+      "name": "New Year's Day",
+      "type": "national",
+      "recurring": true
+    },
+    {
+      "date": "01-15",
+      "name": "Martin Luther King Jr. Day",
+      "type": "national",
+      "recurring": true
+    },
+    {
+      "date": "02-19",
+      "name": "Presidents' Day",
+      "type": "national",
+      "recurring": true
+    },
+    {
+      "date": "05-27",
+      "name": "Memorial Day",
+      "type": "national",
+      "recurring": true
+    },
+    {
+      "date": "06-19",
+      "name": "Juneteenth",
+      "type": "national",
+      "recurring": true
+    },
+    {
+      "date": "07-04",
+      "name": "Independence Day",
+      "type": "national",
+      "recurring": true
+    },
+    {
+      "date": "09-02",
+      "name": "Labor Day",
+      "type": "national",
+      "recurring": true
+    },
+    {
+      "date": "10-14",
+      "name": "Columbus Day",
+      "type": "national",
+      "recurring": true
+    },
+    {
+      "date": "11-11",
+      "name": "Veterans Day",
+      "type": "national",
+      "recurring": true
+    },
+    {
+      "date": "11-28",
+      "name": "Thanksgiving",
+      "type": "national",
+      "recurring": true
+    },
+    {
+      "date": "12-25",
+      "name": "Christmas",
+      "type": "national",
+      "recurring": true
+    },
+    {
+      "date": "03-31",
+      "name": "Cesar Chavez Day",
+      "type": "state",
+      "region": "CA",
+      "recurring": true
+    },
+    {
+      "date": "09-09",
+      "name": "California Admission Day",
+      "type": "state",
+      "region": "CA",
+      "recurring": true
+    },
+    {
+      "date": "2025-01-20",
+      "name": "Company Holiday",
+      "type": "custom",
+      "recurring": false,
+      "year": 2025
+    },
+    {
+      "date": "2025-12-24",
+      "name": "Christmas Eve",
+      "type": "custom",
+      "recurring": false,
+      "year": 2025
+    }
+  ]
+}

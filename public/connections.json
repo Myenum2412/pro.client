@@ -1,0 +1,20 @@
+[
+  {
+    "id": "conn-1767852620777-4brrcjdn6",
+    "fromUserId": "d4bfa7ff-b9fa-45f5-af36-6788a98d6b89",
+    "toUserId": "rajesh-user-id",
+    "toUserName": "Rajesh",
+    "toUserEmail": "rajesh@proultima.com",
+    "connectedAt": "2026-01-08T06:10:20.777Z",
+    "projectId": null
+  },
+  {
+    "id": "conn-1768243821704-dmhiqd4ey",
+    "fromUserId": "d4bfa7ff-b9fa-45f5-af36-6788a98d6b89",
+    "toUserId": "vel-user-id",
+    "toUserName": "Vel",
+    "toUserEmail": "vel@proultima.com",
+    "connectedAt": "2026-01-12T18:50:21.704Z",
+    "projectId": null
+  }
+]
